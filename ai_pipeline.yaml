@@ -1,0 +1,150 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+env:
+  # Docker Registry
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }} # Resolves to owner/repo-name for GHCR
+
+  # Helm Chart Configuration
+  HELM_CHART_PATH: ./charts/my-app # Adjust this to your Helm chart directory
+  HELM_CHART_NAME: my-app          # Name of your Helm chart release
+
+  # Kubernetes Configuration
+  K8S_NAMESPACE: my-app             # Target Kubernetes namespace
+  # KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG_BASE64 }} # Base64 encoded Kubeconfig for deployment (uncomment and configure secret)
+
+jobs:
+  build-test-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write        # Required for pushing Docker images to GHCR
+      security-events: write # Required for CodeQL to upload results
+      id-token: write        # Required for OIDC authentication, e.g., to cloud providers
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # MANDATORY STAGE: Build
+      - name: Setup Go environment (Example: for Go applications)
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22' # Specify your application's Go version
+
+      - name: Build Application
+        run: |
+          echo "Building application..."
+          # Example for a Go application:
+          go mod tidy
+          go build -o my-app .
+          # Replace with your actual build commands (e.g., npm run build, mvn package, etc.)
+          echo "Application built successfully."
+
+      # MANDATORY STAGE: Test
+      - name: Run Tests
+        run: |
+          echo "Running application tests..."
+          # Example for a Go application:
+          go test -v ./...
+          # Replace with your actual test commands
+          echo "Tests completed."
+
+      # MANDATORY STAGE: Security Scan (SAST - CodeQL)
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: go # Specify languages used in your repository (e.g., go, javascript, python, java)
+          # config-file: ./.github/codeql/codeql-config.yml # Uncomment and configure if you have a custom CodeQL config
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+      # MANDATORY STAGE: Docker Build
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }} # GITHUB_TOKEN has permissions to push to GHCR
+
+      - name: Docker Build and Push Image
+        id: docker_build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true # This step also handles pushing the image
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # MANDATORY STAGE: Docker Scan
+      - name: Docker Image Scan (Trivy)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: 'table'
+          exit-code: '1' # Fail the job if vulnerabilities are found
+          severity: 'HIGH,CRITICAL' # Only report high and critical vulnerabilities
+
+      # MANDATORY STAGE: Packaging (Helm Chart)
+      - name: Helm Lint and Package
+        run: |
+          echo "Linting Helm chart..."
+          helm lint ${{ env.HELM_CHART_PATH }}
+          echo "Packaging Helm chart..."
+          helm package ${{ env.HELM_CHART_PATH }} --destination .
+          # You can optionally upload the packaged chart as an artifact if needed:
+          # uses: actions/upload-artifact@v3
+          # with:
+          #   name: helm-chart
+          #   path: "*.tgz"
+
+      # MANDATORY STAGE: Deploy to Kubernetes
+      - name: Deploy to Kubernetes
+        if: github.ref == 'refs/heads/main' # Only deploy on pushes to the main branch
+        uses: dawidd6/action-kubectl@v1.5.0
+        with:
+          # Ensure KUBECONFIG_BASE64 secret is configured in your repository settings
+          kubeconfig: ${{ secrets.KUBECONFIG_BASE64 }}
+          script: |
+            echo "Deploying Helm chart to Kubernetes namespace: ${{ env.K8S_NAMESPACE }}"
+            helm upgrade --install \
+              ${{ env.HELM_CHART_NAME }} \
+              ${{ env.HELM_CHART_PATH }} \
+              --namespace ${{ env.K8S_NAMESPACE }} \
+              --create-namespace \
+              --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+              --set image.tag=${{ github.sha }}
+            echo "Deployment completed."
+
+      # MANDATORY STAGE: Notifications
+      - name: Send Deployment Notification
+        if: always() # Send notification regardless of job success or failure
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com # Example: Use your SMTP server details
+          server_port: 465
+          username: ${{ secrets.MAIL_USERNAME }} # Configure this secret
+          password: ${{ secrets.MAIL_PASSWORD }} # Configure this secret
+          subject: CI/CD Pipeline ${{ job.status }} for ${{ github.repository }}
+          body: |
+            CI/CD Pipeline run for ${{ github.repository }} has completed with status: ${{ job.status }}
+            Commit SHA: ${{ github.sha }}
+            Branch: ${{ github.ref_name }}
+            See workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          to: recipient@example.com # Replace with your notification email
+          from: sender@example.com # Replace with your sender email
